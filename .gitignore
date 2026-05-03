@@ -1,0 +1,25 @@
+﻿# Python bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# Secrets & Credentials (НИКОГДА не коммитить!)
+.env
+token.json
+credentials.json
+
+# Local data & logs
+calendar_bot.db
+*.log
+
+# IDE & OS artifacts
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
