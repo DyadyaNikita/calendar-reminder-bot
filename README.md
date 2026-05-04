@@ -20,6 +20,7 @@
 - Telegram Bot Token (от [@BotFather](https://t.me/BotFather))
 - Google Cloud Project с включённым **Google Calendar API**
 - Файл `credentials.json` (OAuth 2.0 Client ID)
+- VPN! (Логика под прокси в коде не реализована)
 
 ## 🚀 Установка и запуск
 
