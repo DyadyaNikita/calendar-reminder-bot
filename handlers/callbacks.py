@@ -213,7 +213,7 @@ async def snooze_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             event_id=event_id,
             button_version=button_version,
             created_ts=created_ts,
-            minutes=5
+            minutes=15
         )
         
         if not success:

@@ -50,7 +50,7 @@ def get_reminder_lock(user_id: int) -> asyncio.Lock:
     return _reminder_locks[user_id]
 
 
-# Маппинг дружественных названий → IANA timezones
+# Маппинг названий → IANA timezones
 TZ_ALIASES = {
     'москва': 'Europe/Moscow', 'msk': 'Europe/Moscow', 'мск': 'Europe/Moscow',
     'екатеринбург': 'Asia/Yekaterinburg', 'ekb': 'Asia/Yekaterinburg', 'екб': 'Asia/Yekaterinburg',

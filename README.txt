@@ -16,7 +16,7 @@
 - 📁 **Ротация логов** — автосохранение в `logs/bot.log` (10 МБ/файл, 5 архивов)
 
 ## 📋 Требования
-- Python `3.10` или выше
+- Python `3.10`
 - Telegram Bot Token (от [@BotFather](https://t.me/BotFather))
 - Google Cloud Project с включённым **Google Calendar API**
 - Файл `credentials.json` (OAuth 2.0 Client ID)
@@ -113,3 +113,10 @@ OAuth error / Redirect URI mismatch - В Google Cloud добавьте http://lo
 События приходят с неверным временем - Проверьте совпадение пояса в Google Calendar и вывода /set_timezone.
 Бот не отправляет уведомления - Проверьте, что пользователь прошёл /auth и /set_reminder. Логи: logs/bot.log.
 Database is locked / OperationalError - Бот использует aiosqlite с асинхронными подключениями. Перезапустите процесс.
+
+Примечание:
+
+Единственная пограничная ситуация, которая может не сработать:
+Сейчас: 31 декабря 23:59
+Событие в БД: 01.01 00:30 (формат "дд.мм ЧЧ:ММ")
+Если событие в январе, а сейчас декабрь — может не сработать.

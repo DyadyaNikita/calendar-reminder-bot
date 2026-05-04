@@ -179,13 +179,13 @@ def _build_notification_keyboard(
         now_local = datetime.now(ZoneInfo(user_timezone))
         minutes_left = (start_dt - now_local).total_seconds() / 60
         
-        if minutes_left <= 5:
+        if minutes_left <= 15:
             btn = InlineKeyboardButton("⏳ Скоро начнётся", callback_data="noop")
         else:
             current_ver = get_user_reminder_version(user_id)
             created_ts = int(datetime.now(ZoneInfo("UTC")).timestamp())
             btn = InlineKeyboardButton(
-                "🔕 Отложить 5 мин", 
+                "🔕 Отложить 15 мин", 
                 callback_data=f"snooze_{user_id}_{event_id}_{current_ver}_{created_ts}"
             )
         return InlineKeyboardMarkup([[btn]])
@@ -541,16 +541,16 @@ async def handle_snooze_callback(
     event_id: int,
     button_version: int,
     created_ts: int,
-    minutes: int = 5
+    minutes: int = 15
 ):
     """Обработчик нажатия кнопки 'Отложить 5 мин' с валидацией."""
     try:
         now_ts = int(datetime.now(ZoneInfo("UTC")).timestamp())
-        if now_ts - created_ts > 5 * 60:
+        if now_ts - created_ts > 15 * 60:
             await _safe_query_answer(query, "⏳ Время отложки истекло", show_alert=True)
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(
-                "🔕 Отложить не получится: прошло более 5 минут с момента уведомления.",
+                "🔕 Отложить не получится: прошло более 15 минут с момента уведомления.",
                 parse_mode='HTML'
             )
             return False
@@ -579,7 +579,7 @@ async def handle_snooze_callback(
             await _safe_query_answer(query, "⚠️ Настройки изменены", show_alert=True)
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(
-                "🔕 Отложить на 5 минут не получится, так как уже указан новый интервал через <b>/set_reminder</b> в новом сообщении.",
+                "🔕 Отложить на 15 минут не получится, так как уже указан новый интервал через <b>/set_reminder</b> в новом сообщении.",
                 parse_mode='HTML'
             )
             return False
