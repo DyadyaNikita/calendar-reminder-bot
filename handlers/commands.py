@@ -249,7 +249,7 @@ async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_html(
         f"🔐 <b>Авторизация в Google Calendar</b>\n\n"
-        f"1️⃣ Скопируй ссылку и открой в !СВОЁМ! браузере:\n"
+        f"1️⃣ Скопируй ссылку и открой в ⚠️своём браузере:\n"
         f"<code>{auth_url}</code>\n\n"
         f"2️⃣ Выбери аккаунт и нажми <b>Разрешить</b>.\n\n"
         f"3️⃣ После разрешения браузер перенаправит на <code>http://localhost</code>.\n"

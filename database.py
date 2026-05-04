@@ -92,9 +92,13 @@ def parse_datetime_string(dt_str: str, target_tz: str | ZoneInfo = DEFAULT_TIMEZ
             year = now.year
             candidate = datetime(year, month, day, hour, minute, tzinfo=target_tz)
             
-            # Если дата ушла в прошлое >1 дня → событие следующего года
-            if (now - candidate).days > 1:
+            # Если дата кажется в будущем (> 6 мес), значит это прошлый год
+            if (candidate - now).days > 180:
+                candidate = candidate.replace(year=year - 1)
+            # Если дата кажется в прошлом (> 6 мес), значит это следующий год
+            elif (now - candidate).days > 180:
                 candidate = candidate.replace(year=year + 1)
+        
             return candidate
         
         # Только время "ЧЧ:ММ" (обратная совместимость)
@@ -176,6 +180,13 @@ async def init_db():
         try:
             await db.execute('ALTER TABLE events ADD COLUMN location TEXT DEFAULT ""')
             logger.info("Миграция: добавлена колонка location в events")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+        try:
+            await db.execute('ALTER TABLE events ADD COLUMN snooze_until TEXT DEFAULT NULL')
+            logger.info("Миграция: добавлена колонка snooze_until в events")
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise
@@ -546,3 +557,46 @@ async def delete_user_data(user_id: int):
         await db.execute('DELETE FROM user_tokens WHERE user_id = ?', (user_id,))
         await db.commit()
     logger.info("Полностью удалены данные для user_id=%d", user_id)
+
+
+async def get_event_by_id(event_id: int) -> dict | None:
+    """Возвращает полные данные события по ID."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('SELECT * FROM events WHERE id = ?', (event_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_event_by_id(event_id: int) -> dict | None:
+    """Возвращает полные данные события по ID."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('SELECT * FROM events WHERE id = ?', (event_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def set_event_snooze_until(event_id: int, until_utc_iso: str | None):
+    """Сохраняет или очищает время окончания отложки (UTC ISO-строка)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('UPDATE events SET snooze_until = ? WHERE id = ?', (until_utc_iso, event_id))
+        await db.commit()
+
+
+async def get_pending_snoozes() -> list[dict]:
+    """Возвращает события с активной отложкой, которые ещё не уведомили."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        now_utc = datetime.now(ZoneInfo("UTC")).isoformat()
+        cursor = await db.execute('''
+            SELECT id, user_id, snooze_until FROM events
+            WHERE snooze_until IS NOT NULL AND snooze_until > ? AND notified = 0
+        ''', (now_utc,))
+        return [dict(row) for row in await cursor.fetchall()]
+
+async def clear_user_snoozes(user_id: int):
+    """Сбрасывает все активные отложки пользователя при смене настроек."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('UPDATE events SET snooze_until = NULL WHERE user_id = ?', (user_id,))
+        await db.commit()

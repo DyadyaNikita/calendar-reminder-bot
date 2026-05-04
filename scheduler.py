@@ -19,13 +19,17 @@ else:
 from database import (
     get_unnotified_upcoming,
     mark_as_notified,
+    reset_notified,
     get_user_setting,
     get_all_users,
     get_user_timezone,
     parse_datetime_string,
     DEFAULT_TIMEZONE,
     reset_notified_for_window,
-    get_event_info
+    get_event_info,
+    get_event_by_id,
+    set_event_snooze_until,
+    get_pending_snoozes
 )
 
 logger = logging.getLogger(__name__)
@@ -34,6 +38,18 @@ logger = logging.getLogger(__name__)
 _snooze_cache: dict[str, dict] = {}
 # Версия настроек напоминаний для инвалидации устаревших кнопок
 _user_reminder_version: dict[int, int] = {}
+
+_scheduler_instance: AsyncIOScheduler | None = None
+_bot_instance = None
+
+_notification_locks: dict[int, asyncio.Lock] = {}
+
+
+def get_notification_lock(event_id: int) -> asyncio.Lock:
+    """Возвращает или создаёт лок для конкретного события."""
+    if event_id not in _notification_locks:
+        _notification_locks[event_id] = asyncio.Lock()
+    return _notification_locks[event_id]
 
 
 def get_user_reminder_version(user_id: int) -> int:
@@ -95,16 +111,50 @@ async def notify_snooze_override(bot, user_id: int) -> bool:
     Уведомляет пользователя об отмене активных отложек при смене /set_reminder.
     Возвращает True, если были найдены и сброшены активные snooze.
     """
+    from scheduler import _scheduler_instance
+
     keys_to_clear = [
         key for key, data in _snooze_cache.items()
         if key.startswith(f"{user_id}_") and data.get('until') > datetime.now(ZoneInfo("UTC"))
     ]
+
+    try:
+        from database import get_pending_snoozes
+        pending = await get_pending_snoozes()
+        for item in pending:
+            if item['user_id'] == user_id:
+                key = f"{user_id}_{item['id']}"
+                if key not in keys_to_clear:
+                    keys_to_clear.append(key)
+    except Exception as e:
+        logger.warning("Не удалось получить pending snoozes: %s", e)
+
     if not keys_to_clear:
         return False
         
     for k in keys_to_clear:
         del _snooze_cache[k]
         
+        parts = k.split('_')
+        if len(parts) >= 3 and _scheduler_instance:
+            try:
+                e_id = int(parts[1])
+                job_id = f"snooze_job_{user_id}_{e_id}"
+                if _scheduler_instance.get_job(job_id):
+                    _scheduler_instance.remove_job(job_id)
+                    logger.debug("Удалена задача snooze %s из планировщика", job_id)
+            except (ValueError, KeyError) as e:
+                logger.warning("Не удалось удалить задачу snooze %s: %s", k, e)
+
+        try:
+            from database import set_event_snooze_until
+            await set_event_snooze_until(e_id, None)
+            logger.debug("✅ Очищено snooze_until в БД для события %d", e_id)
+        except Exception as e:
+            logger.warning("Не удалось очистить snooze_until в БД: %s", e)
+
+        await set_event_snooze_until(int(parts[1]), None)
+
     await bot.send_message(
         chat_id=user_id,
         text="⚠️ <b>Отложка на 5 минут отменена.</b>\nВы ввели команду /set_reminder с новым значением, поэтому ранее активированное отложение не сработает.",
@@ -199,17 +249,6 @@ async def send_notification(
     logger.error("Не удалось отправить уведомление после %d попыток", retry_count)
     return False
 
-
-async def cleanup_task():
-    """Периодическая задача очистки устаревших событий."""
-    try:
-        deleted = await cleanup_old_events(days_ago=90)
-        if deleted:
-            logger.info("Авто-очистка: удалено %d событий", deleted)
-    except Exception as e:
-        logger.error("Ошибка в задаче очистки: %s", e, exc_info=True)
-
-
 async def auto_sync_events():
     """
     Периодическая синхронизация событий для всех пользователей.
@@ -245,6 +284,101 @@ async def auto_sync_events():
         logger.info("Авто-синхронизация завершена: %d событий сохранено", total_saved)
     except Exception as e:
         logger.error("Критическая ошибка в auto_sync_events: %s", e, exc_info=True)
+
+
+def _get_next_5min_mark_utc(user_tz_str: str) -> datetime:
+    """Вычисляет ближайший 5-минутный рубеж в TZ пользователя и возвращает время в UTC."""
+    user_tz = ZoneInfo(user_tz_str)
+    now_local = datetime.now(user_tz)
+    mins_to_add = 5 - (now_local.minute % 5)
+    run_at_local = now_local.replace(second=0, microsecond=0) + timedelta(minutes=mins_to_add)
+    return run_at_local.astimezone(ZoneInfo("UTC"))
+
+
+async def _deliver_snooze_reminder(user_id: int, event_id: int):
+    """Отправляет отложенное уведомление с защитой от дублей."""
+    lock = get_notification_lock(event_id)
+
+    try:
+        acquired = await asyncio.wait_for(lock.acquire(), timeout=2.0)
+        if not acquired:
+            logger.debug("Не удалось захватить лок для %d, пропускаем", event_id)
+            return
+    except asyncio.TimeoutError:
+        logger.debug("Таймаут лока для %d, пропускаем", event_id)
+        return
+
+    try:
+        snooze_status = is_snoozed(user_id, event_id)
+        if snooze_status in ('overridden', 'none'):
+            await set_event_snooze_until(event_id, None)
+            clear_snooze(user_id, event_id)
+            logger.debug("Snooze отменён, задача %d-%d пропущена", user_id, event_id)
+            return
+
+        event = await get_event_by_id(event_id)
+        if not event or event.get('notified'):
+            await set_event_snooze_until(event_id, None)
+            clear_snooze(user_id, event_id)
+            return
+
+        if event.get('snooze_until') is None:
+            logger.debug("snooze_until=NULL в БД, задача %d-%d пропущена", user_id, event_id)
+            clear_snooze(user_id, event_id)
+            return
+
+        user_tz = await get_user_timezone(user_id)
+        markup = _build_notification_keyboard(user_id, event_id, event['start_time'], user_timezone=user_tz)
+        
+        await mark_as_notified(event_id)
+        
+        success = await send_notification(_bot_instance, user_id, event, reply_markup=markup)
+        
+        if success:
+            logger.info("✅ Snooze доставлено: user=%d, event=%d", user_id, event_id)
+        else:
+            await reset_notified(event_id)
+            logger.warning("Событие %d: отправка не удалась, флаг notified сброшен", event_id)
+        
+        await set_event_snooze_until(event_id, None)
+        clear_snooze(user_id, event_id)
+        
+    except Exception as e:
+        logger.error("Ошибка доставки snooze: %s", e, exc_info=True)
+        try:
+            await reset_notified(event_id)
+        except:
+            pass
+    finally:
+        if lock.locked():
+            lock.release()
+
+
+async def _restore_snooze_jobs(bot, scheduler: AsyncIOScheduler):
+    """Восстанавливает таймеры отложек из БД после перезапуска."""
+    try:
+        pending = await get_pending_snoozes()
+        now_utc = datetime.now(ZoneInfo("UTC"))
+        for item in pending:
+            run_at = datetime.fromisoformat(item['snooze_until'])
+            # Если время уже прошло более 10 мин назад → очищаем, чтобы не спамить
+            if run_at < now_utc - timedelta(minutes=10):
+                await set_event_snooze_until(item['id'], None)
+                continue
+                
+            scheduler.add_job(
+                _deliver_snooze_reminder,
+                trigger='date',
+                run_date=run_at,
+                args=[item['user_id'], item['id']],
+                id=f"snooze_job_{item['user_id']}_{item['id']}",
+                replace_existing=True,
+                misfire_grace_time=60
+            )
+        if pending:
+            logger.info("🔄 Восстановлено %d snooze-таймеров из БД", len(pending))
+    except Exception as e:
+        logger.error("Ошибка восстановления snooze из БД: %s", e, exc_info=True)
 
 
 async def check_reminders(bot):
@@ -286,15 +420,49 @@ async def check_reminders(bot):
                         logger.debug("Пропуск (snooze активен): %s", event['title'])
                         continue
                     
-                    markup = _build_notification_keyboard(user_id, event_id, event['start_time'], user_timezone=user_tz)
-                     
-                    logger.info("Отправка уведомления: %s | start=%s | TZ=%s", event['title'], event['start_time'], user_tz)
-                    
-                    success = await send_notification(bot, user_id, event, reply_markup=markup)
-                    
-                    if success:
+                    lock = get_notification_lock(event_id)
+                    try:
+                        acquired = await asyncio.wait_for(lock.acquire(), timeout=2.0)
+                        if not acquired:
+                            logger.debug("Пропуск %d: не удалось захватить лок", event_id)
+                            continue
+                    except asyncio.TimeoutError:
+                        logger.debug("Таймаут лока для %d в check_reminders", event_id)
+                        continue
+
+                    try:
+                        if event.get('notified'):
+                            logger.debug("Событие %d уже уведомлено (double-check), пропускаем", event_id)
+                            continue
+                        
+                        if is_snoozed(user_id, event_id) == 'active':
+                            logger.debug("Snooze активировался во время ожидания лока для %d", event_id)
+                            continue
+
+                        markup = _build_notification_keyboard(user_id, event_id, event['start_time'], user_timezone=user_tz)
+                         
+                        logger.info("Отправка уведомления (check_reminders): %s | start=%s | TZ=%s", 
+                                  event['title'], event['start_time'], user_tz)
+                        
                         await mark_as_notified(event_id)
-                        logger.debug("Событие %d помечено как уведомлённое", event_id)
+                        
+                        success = await send_notification(bot, user_id, event, reply_markup=markup)
+                        
+                        if success:
+                            logger.debug("Событие %d помечено как уведомлённое (check_reminders)", event_id)
+                        else:
+                            await reset_notified(event_id)
+                            logger.warning("Событие %d: отправка в check_reminders не удалась, флаг сброшен", event_id)
+                            
+                    except Exception as e:
+                        logger.error("Ошибка при отправке уведомления %d: %s", event_id, e, exc_info=True)
+                        try:
+                            await reset_notified(event_id)
+                        except:
+                            pass
+                    finally:
+                        if lock.locked():
+                            lock.release()
                         
             except Exception as user_err:
                 logger.error("Ошибка обработки юзера %d: %s", user_id, user_err, exc_info=True)
@@ -310,7 +478,10 @@ def start_scheduler(bot) -> AsyncIOScheduler:
     Инициализирует и запускает AsyncIOScheduler.
     Все задачи работают в UTC, внутри используют часовой пояс пользователя.
     """
+    global _scheduler_instance, _bot_instance
     scheduler = AsyncIOScheduler(timezone='UTC')
+    _scheduler_instance = scheduler
+    _bot_instance = bot
 
     scheduler.add_job(
         auto_sync_events,
@@ -332,11 +503,10 @@ def start_scheduler(bot) -> AsyncIOScheduler:
     )
 
     scheduler.add_job(
-        cleanup_task,
-        trigger=CronTrigger(day='1', hour=3, minute=0, timezone='UTC'),
-        id='cleanup_old_events',
-        replace_existing=True,
-        max_instances=1
+        _restore_snooze_jobs,
+        trigger='date',
+        run_date=datetime.now(ZoneInfo("UTC")),
+        args=[bot, scheduler]
     )
 
     scheduler.start()
@@ -420,10 +590,36 @@ async def handle_snooze_callback(
             return True
 
         register_snooze(user_id, event_id, minutes)
-        await _safe_query_answer(query, f"⏰ Напомню через {minutes} мин")
+
+        run_at_utc = _get_next_5min_mark_utc(user_tz)
+
+        await set_event_snooze_until(event_id, run_at_utc.isoformat())
+
+        key = f"{user_id}_{event_id}"
+        _snooze_cache[key] = {
+            'until': run_at_utc,
+            'registered_at': datetime.now(ZoneInfo("UTC")),
+            'version': get_user_reminder_version(user_id)
+        }
+        await reset_notified(event_id)
+
+        global _scheduler_instance
+        if _scheduler_instance:
+            _scheduler_instance.add_job(
+                _deliver_snooze_reminder,
+                trigger='date',
+                run_date=run_at_utc,
+                args=[user_id, event_id],
+                id=f"snooze_job_{user_id}_{event_id}",
+                replace_existing=True,
+                misfire_grace_time=30
+        )
+
+        local_fire_time = run_at_utc.astimezone(ZoneInfo(user_tz)).strftime('%H:%M')
+        await _safe_query_answer(query, f"⏰ Напомню ровно в {local_fire_time}")
         await query.edit_message_reply_markup(reply_markup=None)
-        
-        logger.info("User %d отложил событие %d на %d мин (ver=%d)", user_id, event_id, minutes, button_version)
+    
+        logger.info("User %d отложил событие %d до %s (UTC)", user_id, event_id, run_at_utc.isoformat())
         return True
         
     except Exception as e:
